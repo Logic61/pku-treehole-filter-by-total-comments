@@ -10,4 +10,4 @@
 
 注：
 
-对于树洞API的使用，借鉴了https://github.com/SunVapor/pku-treehole-search-agent项目中的代码，原作者声明使用 MIT License，感谢SunVapor的开源贡献。
+对于树洞API的使用，借鉴了 https://github.com/SunVapor/pku-treehole-search-agent 项目中的代码，原作者声明使用 MIT License，感谢SunVapor的开源贡献。
