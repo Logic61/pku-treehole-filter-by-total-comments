@@ -1,6 +1,6 @@
 """
 树洞工具集 (增强版)
-功能1：根据关键词搜索树洞帖子，筛选出评论数大于指定值的帖子，输出洞号。
+功能1：根据关键词搜索树洞帖子，按总评论数或收藏数筛选，输出洞号。
 功能2：查看今日热榜（24小时内，按收藏数×1.2+回复数×1.8排序）
 使用：双击运行，按提示选择功能、输入学号密码等。
 注意：需要连接北大 VPN 或在校内网络环境下使用。
@@ -322,9 +322,40 @@ def get_daily_hot_posts(client, max_pages=75, limit=25):
     hot_posts.sort(key=lambda x: x["value"], reverse=True)
     return hot_posts[:10]
 
+# 搜索接口 likenum 字段依据：上游 SunVapor/pku-treehole-search-agent
+# client.py 的 search_posts 响应示例。独立评论人数尚无可靠数据来源。
+FILTER_METRICS = {
+    "1": ("总评论数", "comment_total"),
+    "2": ("收藏数", "likenum"),
+}
+
+
+def get_metric_value(post, field):
+    """只接受非负整数及其字符串形式；缺失或非法值不能作为零。"""
+    value = post.get(field)
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def filter_posts(posts, field, threshold):
+    """返回 (符合条件的帖子, 指标不可用的帖子数)，保留严格大于语义。"""
+    filtered = []
+    unavailable = 0
+    for post in posts:
+        value = get_metric_value(post, field)
+        if value is None:
+            unavailable += 1
+        elif value > threshold:
+            filtered.append(post)
+    return filtered, unavailable
+
+
 # ==================== 关键词筛选功能 ====================
 def keyword_filter_mode(client):
-    """原有的关键词+评论数筛选功能（支持无关键词）"""
+    """关键词+单项指标筛选（支持无关键词，默认总评论数）。"""
     print("\n" + "=" * 50)
     print("关键词筛选模式")
     print("=" * 50)
@@ -334,23 +365,35 @@ def keyword_filter_mode(client):
         keyword = None
         print("已切换到无关键词模式，将获取全站帖子。")
 
+    print("筛选指标：1. 总评论数（默认）  2. 收藏数")
+    print("3. 独立评论人数（暂不可用：尚未确认完整评论及作者标识）")
+    metric_choice = input("请选择筛选指标 (默认 1): ").strip() or "1"
+    if metric_choice == "3":
+        print("独立评论人数暂不可用，不能用总评论数或部分评论估算。")
+        return
+    if metric_choice not in FILTER_METRICS:
+        print("无效筛选指标")
+        return
+    metric_label, metric_field = FILTER_METRICS[metric_choice]
     try:
-        min_comments = int(input("请输入最小评论数 (如: 100): ").strip())
+        threshold = int(input(f"请输入{metric_label}阈值（严格大于，如 100）: ").strip())
+        if threshold < 0:
+            raise ValueError
     except ValueError:
-        print("最小评论数必须是整数")
+        print("阈值必须是非负整数")
         return
 
-    # 新增起始页和页数
-    start_page_input = input("请输入起始页码 (默认 1): ").strip()
-    start_page = int(start_page_input) if start_page_input else 1
-    page_count_input = input("请输入要爬取的页数 (默认 15): ").strip()
-    page_count = int(page_count_input) if page_count_input else 15
+    try:
+        start_page_input = input("请输入起始页码 (默认 1): ").strip()
+        start_page = int(start_page_input) if start_page_input else 1
+        page_count_input = input("请输入要爬取的页数 (默认 15): ").strip()
+        page_count = int(page_count_input) if page_count_input else 15
+        if start_page < 1 or page_count < 1:
+            raise ValueError
+    except ValueError:
+        print("起始页码和页数必须是正整数")
+        return
     end_page = start_page + page_count - 1
-
-    if start_page < 1:
-        print("起始页码不能小于1，已设为1")
-        start_page = 1
-        end_page = start_page + page_count - 1
 
     LIMIT = 50
     all_posts = []
@@ -358,9 +401,13 @@ def keyword_filter_mode(client):
     print(f"\n开始搜索，从第 {start_page} 页到第 {end_page} 页...")
     while page <= end_page:
         print(f"正在获取第 {page} 页...")
-        result = client.search_posts(keyword=keyword, page=page, limit=LIMIT, comment_limit=0)
+        try:
+            result = client.search_posts(keyword=keyword, page=page, limit=LIMIT, comment_limit=0)
+        except (requests.RequestException, ValueError) as exc:
+            print(f"获取第 {page} 页失败: {exc}；以下仅为已获取范围的结果。")
+            break
         if not result.get("success"):
-            print(f"搜索失败: {result.get('message')}")
+            print(f"搜索失败: {result.get('message')}；以下仅为已获取范围的结果。")
             break
         posts = result["data"]["data"]
         if not posts:
@@ -377,13 +424,19 @@ def keyword_filter_mode(client):
         time.sleep(0.2)
 
     print(f"\n总共获取 {len(all_posts)} 个帖子。")
-    filtered = [p for p in all_posts if p.get("comment_total", 0) > min_comments]
-    print(f"评论数 > {min_comments} 的帖子共有 {len(filtered)} 个：")
+    filtered, unavailable = filter_posts(all_posts, metric_field, threshold)
+    if unavailable:
+        print(f"警告：{unavailable} 个帖子的{metric_label}缺失或无效，已跳过；结果可能不完整。")
+    if all_posts and unavailable == len(all_posts):
+        print(f"当前响应不提供可用的{metric_label}，无法执行此项筛选。")
+        input("\n按回车键返回主菜单...")
+        return
+    print(f"已获取范围内，{metric_label} > {threshold} 的帖子共有 {len(filtered)} 个：")
     if filtered:
         for p in filtered:
             pid = p.get("pid")
-            comment_total = p.get("comment_total", 0)
-            print(f"洞号: {pid} (评论数: {comment_total})")
+            value = get_metric_value(p, metric_field)
+            print(f"洞号: {pid} ({metric_label}: {value})")
     else:
         print("未找到符合条件的帖子。")
     input("\n按回车键返回主菜单...")
@@ -443,7 +496,7 @@ def main():
     # 功能选择循环
     while True:
         print("\n请选择功能：")
-        print("1. 关键词筛选（按评论数过滤）")
+        print("1. 关键词筛选（按总评论数或收藏数过滤）")
         print("2. 今日热榜（无关键词，按热度排序）")
         print("0. 退出")
         choice = input("请输入数字: ").strip()
