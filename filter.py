@@ -12,10 +12,41 @@ import json
 import re
 import uuid
 import random
+import base64
 from datetime import datetime, timedelta
+from urllib.parse import unquote, urlparse
 import time
 from http.cookiejar import Cookie
 import requests
+
+# config.json 里的模板占位符；如果原样使用，IAAA 只会返回“账号或密码错误”。
+CONFIG_PLACEHOLDERS = {"你的学号", "你的密码", "学号", "密码"}
+TOKEN_COOKIE_NAME = "pku_token"
+TOKEN_COOKIE_DOMAIN = "treehole.pku.edu.cn"
+
+
+def is_placeholder_config(username, password):
+    """判断 config.json 是否仍是仓库自带的模板值。"""
+    return username in CONFIG_PLACEHOLDERS or password in CONFIG_PLACEHOLDERS
+
+
+def oauth_error_text(result):
+    """从 IAAA 响应里取出可读错误；IAAA 实际把错误放在 errors.msg。"""
+    if not isinstance(result, dict):
+        return "无法识别的登录响应"
+    errors = result.get("errors")
+    if isinstance(errors, dict):
+        msg = errors.get("msg") or errors.get("message")
+        code = errors.get("code")
+        if msg and code:
+            return f"{msg}（{code}）"
+        if msg:
+            return str(msg)
+    for key in ("msg", "message", "error"):
+        value = result.get(key)
+        if value:
+            return str(value)
+    return "未知错误"
 
 #读信息#
 
@@ -79,10 +110,80 @@ class TreeholeClientSimple:
                     rest=cookie_dict.get("rest", {})
                 )
                 self.session.cookies.set_cookie(cookie)
+            # 只保存 cookies 不够：树洞接口校验的是 Authorization: Bearer <token>。
+            # 重新运行时必须从 pku_token 恢复该请求头，否则有效令牌也会被判未登录。
+            self._restore_authorization()
         except FileNotFoundError:
             pass
         except Exception as e:
             print(f"加载 cookies 出错: {e}")
+
+    def _restore_authorization(self):
+        for cookie in self.session.cookies:
+            if cookie.name == TOKEN_COOKIE_NAME and cookie.value:
+                self.session.headers["authorization"] = f"Bearer {cookie.value}"
+                return cookie.value
+        return None
+
+    def _store_token(self, token):
+        """把登录令牌同时写入 cookie 和 Authorization 头，供本次和下次运行复用。"""
+        self.session.cookies.set(TOKEN_COOKIE_NAME, token, domain=TOKEN_COOKIE_DOMAIN, path="/")
+        self.session.headers["authorization"] = f"Bearer {token}"
+
+    @staticmethod
+    def _token_expiry(token):
+        """读取 JWT 的 exp 声明，用于区分“未过期但失效”和“已过期”，不校验签名。"""
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+            exp = int(claims["exp"])
+            return datetime.fromtimestamp(exp)
+        except (IndexError, KeyError, TypeError, ValueError):
+            return None
+
+    def _login_probe(self):
+        """返回 (是否已登录, 提示信息)；无法判断时第一项为 None。"""
+        try:
+            resp = self.un_read()
+        except requests.RequestException as exc:
+            return None, f"网络请求失败：{exc}"
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        if resp.status_code == 200 and isinstance(data, dict) and (
+            data.get("success") is True or data.get("code") == 20000
+        ):
+            return True, ""
+        message = ""
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("msg") or ""
+        return False, message or f"HTTP {resp.status_code}"
+
+    def try_saved_login(self):
+        """优先用本地保存的令牌登录；失败时清理请求头并返回 False。"""
+        token = self._restore_authorization()
+        if not token:
+            return False
+        expiry = self._token_expiry(token)
+        if expiry is not None and expiry <= datetime.now():
+            print(f"本地登录令牌已于 {expiry:%Y-%m-%d %H:%M} 过期，需要重新登录。")
+            self.session.headers.pop("authorization", None)
+            return False
+        state, message = self._login_probe()
+        if state is True:
+            if expiry is not None:
+                print(f"已使用本地保存的登录令牌（有效期至 {expiry:%Y-%m-%d %H:%M}）。")
+            else:
+                print("已使用本地保存的登录令牌。")
+            return True
+        if state is False:
+            print(f"本地登录令牌已失效（{message}），需要重新登录。")
+        else:
+            print(f"暂时无法确认登录状态（{message}），将尝试重新登录。")
+        self.session.headers.pop("authorization", None)
+        return False
 
     def save_cookies(self):
         cookies_list = []
@@ -114,7 +215,7 @@ class TreeholeClientSimple:
             "otpCode": "",
             "redirUrl": "https://treehole.pku.edu.cn/cas_iaaa_login?uuid=fc71db5799cf&plat=web"
         }
-        resp = self.session.post(url, data=data)
+        resp = self.session.post(url, data=data, timeout=30)
         resp.raise_for_status()
         return resp.json()
 
@@ -126,87 +227,94 @@ class TreeholeClientSimple:
             "_rand": str(random.random()),
             "token": token
         }
-        resp = self.session.get(url, params=params)
+        resp = self.session.get(url, params=params, timeout=30)
         resp.raise_for_status()
-        # 从重定向 URL 中提取 token
-        match = re.search(r"token=(.*)", resp.url)
-        if match:
-            auth_token = match.group(1)
-            self.session.cookies.update({"pku_token": auth_token})
-            self.session.headers.update({"authorization": f"Bearer {auth_token}"})
+        # token 可能出现在查询串或 #/iaaa_success?token=... 片段里；旧代码用
+        # token=(.*) 会把后面的 & 参数一起吞掉，也无法处理片段形式。
+        auth_token = None
+        parsed = urlparse(resp.url)
+        for candidate in (parsed.query, parsed.fragment.split("?", 1)[-1]):
+            match = re.search(r"(?:^|[?&;])token=([^&#\s]+)", candidate)
+            if match:
+                auth_token = unquote(match.group(1))
+                break
+        if auth_token:
+            self._store_token(auth_token)
             return True
         return False
 
     def un_read(self):
-        resp = self.session.get("https://treehole.pku.edu.cn/api/mail/un_read")
+        resp = self.session.get("https://treehole.pku.edu.cn/api/mail/un_read", timeout=30)
         return resp
 
     def send_message(self):
-        resp = self.session.post("https://treehole.pku.edu.cn/api/jwt_send_msg")
+        resp = self.session.post("https://treehole.pku.edu.cn/api/jwt_send_msg", timeout=30)
         return resp
 
     def login_by_message(self, code):
-        resp = self.session.post("https://treehole.pku.edu.cn/api/jwt_msg_verify", data={"valid_code": code})
+        resp = self.session.post("https://treehole.pku.edu.cn/api/jwt_msg_verify", data={"valid_code": code}, timeout=30)
         return resp
 
     def login_by_token(self, token):
-        resp = self.session.post("https://treehole.pku.edu.cn/api/login_iaaa_check_token", data={"code": token})
+        resp = self.session.post("https://treehole.pku.edu.cn/api/login_iaaa_check_token", data={"code": token}, timeout=30)
         return resp
 
     def ensure_login(self, username, password, interactive=True):
-        # 检查是否已登录
-        try:
-            resp = self.un_read()
-            if resp.status_code == 200 and resp.json().get("success"):
-                return True
-        except:
-            pass
-
         # 未登录，执行 OAuth 登录
         print("正在登录...")
         try:
             result = self.oauth_login(username, password)
-            if result.get("success") == "true" or result.get("success") is True:
-                token = result.get("token")
-                if token and self.sso_login(token):
-                    # 二次验证
-                    max_attempts = 5
-                    attempt = 0
-                    while attempt < max_attempts:
-                        attempt += 1
-                        resp = self.un_read()
-                        if resp.status_code == 200 and resp.json().get("success"):
-                            self.save_cookies()
-                            return True
-                        msg = resp.json().get("message", "")
-                        if "手机短信" in msg:
-                            if not interactive:
-                                print("需要短信验证，但当前为非交互模式，登录失败。")
-                                return False
-                            print("需要短信验证码。")
-                            self.send_message()
-                            code = input("请输入短信验证码: ").strip()
-                            self.login_by_message(code)
-                        elif "令牌" in msg:
-                            if not interactive:
-                                print("需要手机令牌验证，但当前为非交互模式，登录失败。")
-                                return False
-                            print("需要手机令牌（PKU Helper 动态码）。")
-                            token_code = input("请输入6位动态令牌: ").strip()
-                            self.login_by_token(token_code)
-                        else:
-                            print(f"未知验证要求: {msg}")
-                            return False
-                    return False
-                else:
-                    print("SSO 登录失败")
-                    return False
-            else:
-                print(f"登录失败: {result.get('msg', '未知错误')}")
-                return False
-        except Exception as e:
-            print(f"登录异常: {e}")
+        except requests.RequestException as exc:
+            print(f"登录请求失败：{exc}")
+            print("请检查网络连接（校内网或北大 VPN）与系统代理设置后重试。")
             return False
+        except Exception as exc:
+            print(f"登录异常：{exc}")
+            return False
+
+        if not (result.get("success") == "true" or result.get("success") is True):
+            message = oauth_error_text(result)
+            print(f"登录失败：{message}")
+            lowered = message.lower()
+            if "not correct" in lowered or "密码" in message or "password" in lowered:
+                print("IAAA 判定账号或密码错误。请确认 config.json 填写的是真实学号与密码，")
+                print("并确认账号没有被临时限制（可先用浏览器登录 treehole.pku.edu.cn 验证）。")
+            elif "锁定" in message or "lock" in lowered or "频繁" in message:
+                print("账号可能因多次失败被临时限制，请等待一段时间后重试。")
+            return False
+
+        token = result.get("token")
+        if not token:
+            print("登录失败：IAAA 返回成功但缺少 token。")
+            return False
+        if not self.sso_login(token):
+            print("SSO 登录失败：未能从树洞回调地址中取得登录令牌。")
+            print("可能是树洞登录接口有变动，请把本次运行输出反馈给维护者。")
+            return False
+
+        # 二次验证：短信验证码或手机令牌（PKU Helper 动态码）
+        for _ in range(5):
+            state, message = self._login_probe()
+            if state is True:
+                self.save_cookies()
+                return True
+            if not interactive:
+                print("需要额外验证，但当前为非交互模式，登录失败。")
+                return False
+            if "手机短信" in message or "短信" in message:
+                print("需要短信验证码。")
+                self.send_message()
+                code = input("请输入短信验证码: ").strip()
+                self.login_by_message(code)
+            elif "令牌" in message or "动态" in message:
+                print("需要手机令牌（PKU Helper 动态码）。")
+                token_code = input("请输入6位动态令牌: ").strip()
+                self.login_by_token(token_code)
+            else:
+                print(f"登录未完成：{message}")
+                return False
+        print("多次验证仍未成功，登录失败。")
+        return False
 
     # ---------- 原有方法：使用新版 API 搜索帖子（支持无关键词）----------
     def search_posts(self, keyword=None, page=1, limit=50, comment_limit=0):
@@ -221,7 +329,7 @@ class TreeholeClientSimple:
         }
         if keyword:  # 只有非空关键词才添加
             params["keyword"] = keyword
-        resp = self.session.get(url, params=params)
+        resp = self.session.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") == 20000:
@@ -266,7 +374,7 @@ class TreeholeClientSimple:
         params = {"page": page, "limit": limit}
         if keyword:
             params["keyword"] = keyword
-        resp = self.session.get(url, params=params)
+        resp = self.session.get(url, params=params, timeout=30)
         resp.raise_for_status()
         return resp.json()
 
@@ -669,28 +777,38 @@ def main():
     print("=" * 50)
     print("注意：请确保已连接北大 VPN 或在校内网络环境下运行。\n")
 
-    # 登录
-    cfg_user, cfg_pass = load_config()
-    if cfg_user and cfg_pass:
-        use_cfg = input(f"检测到配置文件中的账号：{cfg_user}，是否使用？(y/n，默认 y): ").strip().lower()
-        if use_cfg != 'n':
-            username, password = cfg_user, cfg_pass
+    client = TreeholeClientSimple()
+    print("\n正在检查登录状态...")
+    logged_in = client.try_saved_login()
+
+    if not logged_in:
+        # 没有可用令牌，才需要账号密码。
+        cfg_user, cfg_pass = load_config()
+        if is_placeholder_config(cfg_user, cfg_pass):
+            print("config.json 里仍是模板占位符（你的学号/你的密码）。")
+            print("请先在 config.json 填写真实学号与密码，或按提示手动输入。")
+            cfg_user, cfg_pass = None, None
+        if cfg_user and cfg_pass:
+            use_cfg = input(f"检测到配置文件中的账号：{cfg_user}，是否使用？(y/n，默认 y): ").strip().lower()
+            if use_cfg != 'n':
+                username, password = cfg_user, cfg_pass
+            else:
+                username = input("请输入学号: ").strip()
+                password = input("请输入密码: ").strip()
         else:
             username = input("请输入学号: ").strip()
             password = input("请输入密码: ").strip()
-    else:
-        username = input("请输入学号: ").strip()
-        password = input("请输入密码: ").strip()
 
-    if not username or not password:
-        print("学号或密码不能为空")
-        input("按回车键退出...")
-        return
+        if not username or not password:
+            print("学号或密码不能为空")
+            input("按回车键退出...")
+            return
 
-    client = TreeholeClientSimple()
-    print("\n正在登录树洞，可能需要几秒钟...")
-    if not client.ensure_login(username, password, interactive=True):
-        print("登录失败，请检查学号密码，并确认网络正常（需要VPN/校内网）。")
+        print("\n正在登录树洞，可能需要几秒钟...")
+        logged_in = client.ensure_login(username, password, interactive=True)
+
+    if not logged_in:
+        print("登录失败：请检查 config.json 里的学号密码，并确认网络正常（需要 VPN/校内网）。")
         input("按回车键退出...")
         return
     print("登录成功！\n")

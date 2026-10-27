@@ -2,7 +2,7 @@
 
 使用方法：
 
-1.在config.json配置好用户名、密码。
+1.把 config.json 里的 `username`、`password` 改成真实学号与密码。仓库自带的是「你的学号/你的密码」占位符，原样运行会登录失败（程序会给出提示）。
 
 2.安装依赖 `python -m pip install -r requirements.txt`，运行 `python filter.py`。选择功能 1 后弹出条件窗口，勾选总评论数、收藏数、独立评论人数中的一项或多项，并分别填写阈值。多项条件须同时满足，比较均为严格大于；未勾选项不参与筛选。确定后回到终端输入关键词（留空为无关键词）、起始页码和搜索页数。结果仅显示勾选的指标。阈值必须为非负整数，页码和页数必须为正整数；取消或关闭窗口返回主菜单。
 
@@ -22,6 +22,8 @@
 - 当前旧评论接口的无评论响应为 `data: {}`；程序额外读取帖子详情确认 `reply == 0` 才报告 0 人。空响应但回复数不为零或无法确认时仍提示跳过。
 - 评论接口及分页依据：[上游 client.py](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/client.py) 和 [agent.py](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/agent.py)；昵称字段依据：[utils.py](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/utils.py)。
 - 收藏字段依据：[上游客户端 search_posts 响应示例](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/client.py)。评论解析已用实际登录响应验证，测试不保存评论正文或登录凭据。
+- 登录优先复用本地保存的令牌：`~/.treehole_cookies.json` 里的 `pku_token` 会恢复成 `Authorization: Bearer` 请求头，令牌未过期时不再请求 IAAA；只有缺失、失效或过期时才用账号密码登录。令牌有效期以 JWT 的 `exp` 为准（约一个月），启动时会打印到期时间。
+- IAAA 登录失败时程序会显示其具体原因（账号或密码错误、短信/手机令牌验证、临时锁定等），不再统一显示“未知错误”。短信和手机令牌两种二次验证仍按提示交互输入。
 - 今日热榜保持原行为。源码改动不会更新已有 `dist/filter.exe`；需要使用 `pyinstaller filter.spec` 重新打包。
 
 离线验证：`python -m unittest discover -s tests -v`。测试使用模拟响应，无需账号或校内网络。
