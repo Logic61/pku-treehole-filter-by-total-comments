@@ -366,6 +366,117 @@ def filter_posts(posts, field, threshold):
     return filtered, unavailable
 
 
+def parse_filter_conditions(rows):
+    """只校验勾选项，返回 (标签, 字段, 阈值) 列表。"""
+    conditions = []
+    for label, field, enabled, raw in rows:
+        if not enabled:
+            continue
+        value = get_metric_value({field: raw}, field)
+        if value is None:
+            raise ValueError(f"{label}阈值必须是非负整数")
+        conditions.append((label, field, value))
+    if not conditions:
+        raise ValueError("请至少勾选一个筛选条件")
+    return conditions
+
+
+def choose_filter_conditions():
+    """主菜单选择 1 后弹出复选框，多项条件按 AND 组合。"""
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except ImportError:
+        print("当前 Python 未安装 Tkinter，无法打开条件选择框。")
+        return None
+    try:
+        window = tk.Tk()
+    except tk.TclError as exc:
+        print(f"无法打开条件选择框：{exc}")
+        return None
+    window.title("选择筛选条件")
+    window.resizable(False, False)
+    panel = ttk.Frame(window, padding=24)
+    panel.grid()
+    ttk.Label(panel, text="勾选要使用的筛选条件", font=("Microsoft YaHei UI", 13, "bold")).grid(
+        row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+    ttk.Label(panel, text="多选时须同时满足；每项均严格大于右侧阈值。").grid(
+        row=1, column=0, columnspan=3, sticky="w", pady=(0, 16))
+    rows = []
+    for index, (label, field) in enumerate(FILTER_METRICS.values(), 2):
+        enabled = tk.BooleanVar(value=False)
+        value = tk.StringVar(value="0")
+        entry = ttk.Entry(panel, textvariable=value, width=12, state="disabled")
+        def toggle(flag=enabled, widget=entry):
+            widget.configure(state="normal" if flag.get() else "disabled")
+        ttk.Checkbutton(panel, text=label, variable=enabled, command=toggle).grid(
+            row=index, column=0, sticky="w", pady=8)
+        ttk.Label(panel, text=">").grid(row=index, column=1, padx=16)
+        entry.grid(row=index, column=2, sticky="e")
+        rows.append((label, field, enabled, value))
+    ttk.Label(panel, text="独立评论人数需额外读取评论，可能耗时较长。").grid(
+        row=5, column=0, columnspan=3, sticky="w", pady=(12, 4))
+    error = tk.StringVar()
+    ttk.Label(panel, textvariable=error, foreground="#b42318").grid(
+        row=6, column=0, columnspan=3, sticky="w", pady=8)
+    result = None
+    def confirm():
+        nonlocal result
+        try:
+            result = parse_filter_conditions([
+                (label, field, enabled.get(), value.get())
+                for label, field, enabled, value in rows])
+        except ValueError as exc:
+            error.set(str(exc))
+            return
+        window.destroy()
+    buttons = ttk.Frame(panel)
+    buttons.grid(row=7, column=0, columnspan=3, sticky="e")
+    ttk.Button(buttons, text="取消", command=window.destroy).pack(side="left", padx=(0, 8))
+    ttk.Button(buttons, text="确定", command=confirm).pack(side="left")
+    window.bind("<Return>", lambda event: confirm())
+    window.bind("<Escape>", lambda event: window.destroy())
+    window.attributes("-topmost", True)
+    window.after(250, lambda: window.attributes("-topmost", False))
+    window.mainloop()
+    return result
+
+
+def filter_posts_by_conditions(client, posts, conditions):
+    """AND 筛选；先检查已返回指标，只对剩余候选读取评论。"""
+    matches, issues = [], []
+    counts = {}
+    cheap = [(label, field, threshold) for label, field, threshold in conditions
+             if field != "unique_commenters"]
+    unique = next((condition for condition in conditions
+                   if condition[1] == "unique_commenters"), None)
+    for original in posts:
+        post = dict(original)
+        values = [(label, get_metric_value(post, field), threshold)
+                  for label, field, threshold in cheap]
+        if any(value is not None and value <= threshold for _, value, threshold in values):
+            continue
+        missing = [label for label, value, _ in values if value is None]
+        if missing:
+            issues.append((post.get("pid"), "、".join(missing) + "缺失或无效"))
+            continue
+        if unique:
+            label, field, threshold = unique
+            pid = post.get("pid")
+            key = str(pid)
+            if key not in counts:
+                counts[key] = count_unique_commenters(client, pid)
+            count, error = counts[key]
+            if error:
+                issues.append((pid, error))
+                continue
+            post[field] = count
+            if count <= threshold:
+                continue
+        matches.append(post)
+    return matches, issues
+
+
 def count_unique_commenters(client, pid, max_pages=1000):
     """按单帖 name_tag 去重，包含实际回复的洞主；失败时返回未知及原因。
 
@@ -432,30 +543,21 @@ def count_unique_commenters(client, pid, max_pages=1000):
 
 # ==================== 关键词筛选功能 ====================
 def keyword_filter_mode(client):
-    """关键词+单项指标筛选（支持无关键词，默认总评论数）。"""
+    """按勾选条件联合筛选；支持无关键词。"""
     print("\n" + "=" * 50)
     print("关键词筛选模式")
     print("=" * 50)
+    conditions = choose_filter_conditions()
+    if not conditions:
+        print("已取消筛选，返回主菜单。")
+        return
+    description = " 且 ".join(f"{label} > {threshold}" for label, _, threshold in conditions)
+    print(f"已选择：{description}")
     keyword = input("请输入搜索关键词（直接回车表示无关键词，即全站搜索）: ").strip()
     # 如果 keyword 为空字符串，后续 search_posts 会不传 keyword 参数，实现无关键词查找
     if keyword == "":
         keyword = None
         print("已切换到无关键词模式，将获取全站帖子。")
-
-    print("筛选指标：1. 总评论数（默认）  2. 收藏数")
-    print("3. 独立评论人数（逐帖读取全部评论，按匿名昵称去重）")
-    metric_choice = input("请选择筛选指标 (默认 1): ").strip() or "1"
-    if metric_choice not in FILTER_METRICS:
-        print("无效筛选指标")
-        return
-    metric_label, metric_field = FILTER_METRICS[metric_choice]
-    try:
-        threshold = int(input(f"请输入{metric_label}阈值（严格大于，如 100）: ").strip())
-        if threshold < 0:
-            raise ValueError
-    except ValueError:
-        print("阈值必须是非负整数")
-        return
 
     try:
         start_page_input = input("请输入起始页码 (默认 1): ").strip()
@@ -498,34 +600,24 @@ def keyword_filter_mode(client):
         time.sleep(0.2)
 
     print(f"\n总共获取 {len(all_posts)} 个帖子。")
-    if metric_field == "unique_commenters":
-        print("正在逐帖统计独立评论人数（包含实际回复的洞主；可能耗时较长）...")
-        counts = {}
-        for post in all_posts:
-            pid = post.get("pid")
-            key = str(pid)
-            if key not in counts:
-                counts[key] = count_unique_commenters(client, pid)
-            count, error = counts[key]
-            # 覆盖可能来自搜索响应的同名字段，失败时不能沿用旧值。
-            post[metric_field] = count
-            if error:
-                print(f"洞号 {pid}：{error}，已跳过。")
-    filtered, unavailable = filter_posts(all_posts, metric_field, threshold)
-    if unavailable:
-        print(f"警告：{unavailable} 个帖子的{metric_label}缺失或无效，已跳过；结果可能不完整。")
-    if all_posts and unavailable == len(all_posts):
-        print(f"当前响应不提供可用的{metric_label}，无法执行此项筛选。")
-        input("\n按回车键返回主菜单...")
-        return
-    print(f"已获取范围内，{metric_label} > {threshold} 的帖子共有 {len(filtered)} 个：")
-    if filtered:
-        for p in filtered:
-            pid = p.get("pid")
-            value = get_metric_value(p, metric_field)
-            print(f"洞号: {pid} ({metric_label}: {value})")
+    if any(field == "unique_commenters" for _, field, _ in conditions):
+        print("正在按勾选条件筛选；仅对满足其他条件的帖子读取评论...")
+    filtered, issues = filter_posts_by_conditions(client, all_posts, conditions)
+    for pid, reason in issues:
+        print(f"洞号 {pid}：{reason}，已跳过。")
+    if issues:
+        print(f"警告：{len(issues)} 个帖子的勾选指标无法确认，结果可能不完整。")
+    if all_posts and len(issues) == len(all_posts):
+        print("当前响应不提供可用的勾选指标，无法执行此项筛选。")
     else:
-        print("未找到符合条件的帖子。")
+        print(f"已获取范围内，满足 {description} 的帖子共有 {len(filtered)} 个：")
+        if filtered:
+            for post in filtered:
+                details = "，".join(f"{label}: {get_metric_value(post, field)}"
+                                    for label, field, _ in conditions)
+                print(f"洞号: {post.get('pid')} ({details})")
+        else:
+            print("未找到符合条件的帖子。")
     input("\n按回车键返回主菜单...")
 
 # ==================== 今日热榜功能 ====================
@@ -583,7 +675,7 @@ def main():
     # 功能选择循环
     while True:
         print("\n请选择功能：")
-        print("1. 关键词筛选（总评论数、收藏数或独立评论人数）")
+        print("1. 条件筛选（勾选总评论数、收藏数、独立评论人数）")
         print("2. 今日热榜（无关键词，按热度排序）")
         print("0. 退出")
         choice = input("请输入数字: ").strip()

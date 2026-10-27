@@ -63,7 +63,7 @@ class UniqueTests(unittest.TestCase):
             {"pid": 1}, {"pid": 2}]}}
         client.get_comments.side_effect = [response(["Alice", "Bob"]), response(["Alice"])]
         output = io.StringIO()
-        with patch("builtins.input", side_effect=["", "3", "1", "", "1", ""]), contextlib.redirect_stdout(output):
+        with patch.object(app, "choose_filter_conditions", return_value=[("独立评论人数", "unique_commenters", 1)]), patch("builtins.input", side_effect=["", "", "1", ""]), contextlib.redirect_stdout(output):
             app.keyword_filter_mode(client)
         self.assertIn("洞号: 1 (独立评论人数: 2)", output.getvalue())
         self.assertNotIn("洞号: 2 (", output.getvalue())
@@ -74,7 +74,7 @@ class UniqueTests(unittest.TestCase):
             {"pid": 1, "unique_commenters": 999}]}}
         client.get_comments.return_value = {"success": False}
         output = io.StringIO()
-        with patch("builtins.input", side_effect=["", "3", "1", "", "1", ""]), contextlib.redirect_stdout(output):
+        with patch.object(app, "choose_filter_conditions", return_value=[("独立评论人数", "unique_commenters", 1)]), patch("builtins.input", side_effect=["", "", "1", ""]), contextlib.redirect_stdout(output):
             app.keyword_filter_mode(client)
         self.assertIn("无法执行此项筛选", output.getvalue())
         self.assertNotIn("999", output.getvalue())
