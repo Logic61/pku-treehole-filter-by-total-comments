@@ -43,11 +43,6 @@ class FilterTests(unittest.TestCase):
         self.assertIn("无法执行此项筛选", text)
         self.assertNotIn("未找到符合条件", text)
 
-    def test_unique_is_explicitly_unavailable(self):
-        client, text = self.run_mode(["", "3"], [])
-        client.search_posts.assert_not_called()
-        self.assertIn("独立评论人数暂不可用", text)
-
     def test_invalid_inputs_do_not_request(self):
         for inputs in (["", "9"], ["", "2", "-1"], ["", "1", "x"], ["", "1", "0", "x", "1"], ["", "1", "0", "1", "0"]):
             with self.subTest(inputs=inputs):

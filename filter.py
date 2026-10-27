@@ -1,6 +1,6 @@
 """
 树洞工具集 (增强版)
-功能1：根据关键词搜索树洞帖子，按总评论数或收藏数筛选，输出洞号。
+功能1：根据关键词搜索树洞帖子，按总评论数、收藏数或独立评论人数筛选，输出洞号。
 功能2：查看今日热榜（24小时内，按收藏数×1.2+回复数×1.8排序）
 使用：双击运行，按提示选择功能、输入学号密码等。
 注意：需要连接北大 VPN 或在校内网络环境下使用。
@@ -235,6 +235,18 @@ class TreeholeClientSimple:
         else:
             return {"success": False, "message": data.get("message", "未知错误")}
 
+    def get_comments(self, pid, page=1, limit=100):
+        """分页读取评论；不读取或保存评论者的真实身份。"""
+        if not str(pid).isascii() or not str(pid).isdigit():
+            raise ValueError("无效洞号")
+        response = self.session.get(
+            f"https://treehole.pku.edu.cn/api/pku_comment_v3/{pid}",
+            params={"page": page, "limit": limit, "sort": "asc"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
     # ---------- 新增方法：使用旧版 API 获取原始树洞列表（用于热榜）----------
     def get_hole_list(self, page=1, limit=25, keyword=None):
         """
@@ -323,10 +335,11 @@ def get_daily_hot_posts(client, max_pages=75, limit=25):
     return hot_posts[:10]
 
 # 搜索接口 likenum 字段依据：上游 SunVapor/pku-treehole-search-agent
-# client.py 的 search_posts 响应示例。独立评论人数尚无可靠数据来源。
+# client.py 的 search_posts/get_comment，以及 utils.py 的 name_tag 展示。
 FILTER_METRICS = {
     "1": ("总评论数", "comment_total"),
     "2": ("收藏数", "likenum"),
+    "3": ("独立评论人数", "unique_commenters"),
 }
 
 
@@ -353,6 +366,70 @@ def filter_posts(posts, field, threshold):
     return filtered, unavailable
 
 
+def count_unique_commenters(client, pid, max_pages=1000):
+    """按单帖 name_tag 去重，包含实际回复的洞主；失败时返回未知及原因。
+
+    分页结构来自上游 agent._fetch_all_comments_for_post。必须有分页元数据，
+    不将搜索命中的 comment_total 当作该帖完整评论总数。
+    """
+    names = set()
+    seen_pages = set()
+    seen_ids = set()
+    received = 0
+    expected_last = expected_total = None
+    for page in range(1, max_pages + 1):
+        try:
+            response = client.get_comments(pid, page=page, limit=100)
+            if not isinstance(response, dict) or not (
+                response.get("success") is True or response.get("code") == 20000
+            ):
+                return None, "评论接口返回失败"
+            data = response.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                return None, "无法识别评论响应结构"
+            comments = data["data"]
+            last = get_metric_value(data, "last_page")
+            total = get_metric_value(data, "total")
+            if page == 1:
+                expected_last, expected_total = last, total
+                if last is None or last < 1:
+                    return None, "缺少有效 last_page，无法确认评论是否完整"
+                if last > max_pages:
+                    return None, "评论页数超过上限，未完成统计"
+            elif last != expected_last or total != expected_total:
+                return None, "抓取期间分页信息变化，未完成统计"
+            if not comments and (page < expected_last or expected_last > 1):
+                return None, "评论分页提前为空，未完成统计"
+            if comments:
+                fingerprint = json.dumps(comments, sort_keys=True, ensure_ascii=False)
+                if fingerprint in seen_pages:
+                    return None, "评论接口返回重复页，未完成统计"
+                seen_pages.add(fingerprint)
+            for comment in comments:
+                if not isinstance(comment, dict):
+                    return None, "评论记录格式无效"
+                name = comment.get("name_tag")
+                if not isinstance(name, str) or not name.strip() or name.strip().lower() == "anonymous":
+                    return None, "评论匿名昵称缺失，无法准确去重"
+                # cid 若存在，用于发现分页重叠；不猜测其他身份字段。
+                cid = comment.get("cid")
+                if cid is not None:
+                    key = str(cid)
+                    if key in seen_ids:
+                        return None, "评论分页重叠，未完成统计"
+                    seen_ids.add(key)
+                names.add(name.strip())
+            received += len(comments)
+            if page == expected_last:
+                if expected_total is not None and received != expected_total:
+                    return None, "评论条数与接口总数不一致，未完成统计"
+                return len(names), None
+            time.sleep(0.2)
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            return None, f"评论读取失败：{exc}"
+    return None, "评论页数超过上限，未完成统计"
+
+
 # ==================== 关键词筛选功能 ====================
 def keyword_filter_mode(client):
     """关键词+单项指标筛选（支持无关键词，默认总评论数）。"""
@@ -366,11 +443,8 @@ def keyword_filter_mode(client):
         print("已切换到无关键词模式，将获取全站帖子。")
 
     print("筛选指标：1. 总评论数（默认）  2. 收藏数")
-    print("3. 独立评论人数（暂不可用：尚未确认完整评论及作者标识）")
+    print("3. 独立评论人数（逐帖读取全部评论，按匿名昵称去重）")
     metric_choice = input("请选择筛选指标 (默认 1): ").strip() or "1"
-    if metric_choice == "3":
-        print("独立评论人数暂不可用，不能用总评论数或部分评论估算。")
-        return
     if metric_choice not in FILTER_METRICS:
         print("无效筛选指标")
         return
@@ -424,6 +498,19 @@ def keyword_filter_mode(client):
         time.sleep(0.2)
 
     print(f"\n总共获取 {len(all_posts)} 个帖子。")
+    if metric_field == "unique_commenters":
+        print("正在逐帖统计独立评论人数（包含实际回复的洞主；可能耗时较长）...")
+        counts = {}
+        for post in all_posts:
+            pid = post.get("pid")
+            key = str(pid)
+            if key not in counts:
+                counts[key] = count_unique_commenters(client, pid)
+            count, error = counts[key]
+            # 覆盖可能来自搜索响应的同名字段，失败时不能沿用旧值。
+            post[metric_field] = count
+            if error:
+                print(f"洞号 {pid}：{error}，已跳过。")
     filtered, unavailable = filter_posts(all_posts, metric_field, threshold)
     if unavailable:
         print(f"警告：{unavailable} 个帖子的{metric_label}缺失或无效，已跳过；结果可能不完整。")
@@ -496,7 +583,7 @@ def main():
     # 功能选择循环
     while True:
         print("\n请选择功能：")
-        print("1. 关键词筛选（按总评论数或收藏数过滤）")
+        print("1. 关键词筛选（总评论数、收藏数或独立评论人数）")
         print("2. 今日热榜（无关键词，按热度排序）")
         print("0. 退出")
         choice = input("请输入数字: ").strip()
