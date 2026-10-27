@@ -16,11 +16,12 @@
 
 - 总评论数使用搜索响应的 `comment_total`，收藏数使用 `likenum`；不额外请求旧接口，不改变搜索及分页语义。
 - 字段接受非负整数或整数字符串。缺失、null 或非法值会被跳过并提示；全部不可用时明确报告无法筛选，不将未知值当作 0。
-- 勾选独立评论人数可试用该项筛选：逐帖请求 `/api/pku_comment_v3/{pid}`，按同一帖子全部评论的 `name_tag` 去重。包含实际发表评论的洞主，不计未回复的发帖者；只统计接口当前可见评论，不推测删除或隐藏评论的作者。不同帖子的同名昵称分别统计。
-- 该统计采用“同帖匿名昵称对应固定评论者”的口径，不根据最大字母推算人数。当前服务端字段及昵称稳定性尚需真实账号验证。
+- 勾选独立评论人数可试用该项筛选：逐帖请求 `/api/pku_comment_v3/{pid}`，按同一帖子全部评论的 `name` 去重（兼容 `name_tag`）。包含实际发表评论的洞主，不计未回复的发帖者；只统计接口当前可见评论，不推测删除或隐藏评论的作者。不同帖子的同名昵称分别统计。
+- 该统计采用“同帖匿名昵称对应固定评论者”的口径，不根据最大字母推算人数。已用登录会话核验当前评论接口的 `name` 字段；同帖 Alice 等昵称按实际值去重。
 - 必须读完 `last_page` 指定的所有评论页；若有 `total`，还要核对条数。缺少分页元数据、昵称缺失、重复页、分页变化、条数不符、超时或超过 1000 页上限时，该帖明确标为不可用并跳过，不把部分统计当作准确人数。抓取期间内容变化仍可能影响结果。
+- 当前旧评论接口的无评论响应为 `data: {}`；程序额外读取帖子详情确认 `reply == 0` 才报告 0 人。空响应但回复数不为零或无法确认时仍提示跳过。
 - 评论接口及分页依据：[上游 client.py](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/client.py) 和 [agent.py](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/agent.py)；昵称字段依据：[utils.py](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/utils.py)。
-- 收藏字段依据：[上游客户端 search_posts 响应示例](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/client.py)。尚未使用真实账号验证当前服务端响应。
+- 收藏字段依据：[上游客户端 search_posts 响应示例](https://github.com/SunVapor/pku-treehole-search-agent/blob/a4428000548c71dfb456849d564287e38a08a763/client.py)。评论解析已用实际登录响应验证，测试不保存评论正文或登录凭据。
 - 今日热榜保持原行为。源码改动不会更新已有 `dist/filter.exe`；需要使用 `pyinstaller filter.spec` 重新打包。
 
 离线验证：`python -m unittest discover -s tests -v`。测试使用模拟响应，无需账号或校内网络。

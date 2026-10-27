@@ -235,6 +235,15 @@ class TreeholeClientSimple:
         else:
             return {"success": False, "message": data.get("message", "未知错误")}
 
+    def get_post(self, pid):
+        """获取帖子详情，用于核验空评论响应是否确为零回复。"""
+        if not str(pid).isascii() or not str(pid).isdigit():
+            raise ValueError("无效洞号")
+        response = self.session.get(
+            f"https://treehole.pku.edu.cn/api/pku/{pid}", timeout=30)
+        response.raise_for_status()
+        return response.json()
+
     def get_comments(self, pid, page=1, limit=100):
         """分页读取评论；不读取或保存评论者的真实身份。"""
         if not str(pid).isascii() or not str(pid).isdigit():
@@ -478,7 +487,7 @@ def filter_posts_by_conditions(client, posts, conditions):
 
 
 def count_unique_commenters(client, pid, max_pages=1000):
-    """按单帖 name_tag 去重，包含实际回复的洞主；失败时返回未知及原因。
+    """按单帖匿名 name 去重，兼容 name_tag，包含实际回复的洞主；失败时返回未知及原因。
 
     分页结构来自上游 agent._fetch_all_comments_for_post。必须有分页元数据，
     不将搜索命中的 comment_total 当作该帖完整评论总数。
@@ -496,6 +505,16 @@ def count_unique_commenters(client, pid, max_pages=1000):
             ):
                 return None, "评论接口返回失败"
             data = response.get("data")
+            # 实测旧评论接口在零评论时返回 data: {}，并无分页对象。
+            # 额外核验帖子详情的 reply，避免把异常空响应当作 0 人。
+            if page == 1 and data == {}:
+                detail = client.get_post(pid)
+                if isinstance(detail, dict) and (
+                    detail.get("success") is True or detail.get("code") == 20000
+                ) and isinstance(detail.get("data"), dict):
+                    if get_metric_value(detail["data"], "reply") == 0:
+                        return 0, None
+                return None, "评论响应为空，但未能确认帖子零回复"
             if not isinstance(data, dict) or not isinstance(data.get("data"), list):
                 return None, "无法识别评论响应结构"
             comments = data["data"]
@@ -519,7 +538,11 @@ def count_unique_commenters(client, pid, max_pages=1000):
             for comment in comments:
                 if not isinstance(comment, dict):
                     return None, "评论记录格式无效"
-                name = comment.get("name_tag")
+                # 实测 /api/pku_comment_v3 返回 name（Alice、Bob、洞主等）。
+                # name_tag 是上游搜索结果使用的字段，只作为兼容后备。
+                name = comment.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    name = comment.get("name_tag")
                 if not isinstance(name, str) or not name.strip() or name.strip().lower() == "anonymous":
                     return None, "评论匿名昵称缺失，无法准确去重"
                 # cid 若存在，用于发现分页重叠；不猜测其他身份字段。

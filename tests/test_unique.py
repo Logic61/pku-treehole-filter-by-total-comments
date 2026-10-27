@@ -7,7 +7,7 @@ import filter as app
 
 
 def response(names, last=1, total=None, code=False):
-    data = {"data": [{"name_tag": n} for n in names], "last_page": last}
+    data = {"data": [{"name": n} for n in names], "last_page": last}
     if total is not None:
         data["total"] = total
     return {("code" if code else "success"): (20000 if code else True), "data": data}
@@ -78,6 +78,41 @@ class UniqueTests(unittest.TestCase):
             app.keyword_filter_mode(client)
         self.assertIn("无法执行此项筛选", output.getvalue())
         self.assertNotIn("999", output.getvalue())
+
+    def test_legacy_name_tag_remains_supported(self):
+        page = response(["Alice"])
+        page["data"]["data"] = [{"name_tag": "Alice"}, {"name_tag": "Alice"}, {"name_tag": "Bob"}]
+        self.assertEqual(self.count([page])[0], (2, None))
+
+    def test_live_shape_name_field_counts_lz_and_duplicates(self):
+        # 脱敏结构取自实际响应，不保存评论正文。
+        page = response(["Alice", "Alice", "Bob", "Carol", "洞主"], total=5, code=True)
+        self.assertEqual(self.count([page])[0], (4, None))
+
+    def test_empty_object_requires_confirmed_zero_reply(self):
+        for reply, expected in ((0, 0), (1, None), (None, None)):
+            with self.subTest(reply=reply):
+                client = Mock()
+                client.get_comments.return_value = {"code": 20000, "success": True, "data": {}}
+                client.get_post.return_value = {"code": 20000, "data": {"reply": reply}}
+                count, error = app.count_unique_commenters(client, 123)
+                self.assertEqual(count, expected)
+                self.assertEqual(error is None, expected == 0)
+                client.get_post.assert_called_once_with(123)
+
+    def test_empty_object_detail_failure_is_unknown(self):
+        client = Mock()
+        client.get_comments.return_value = {"success": True, "data": {}}
+        client.get_post.side_effect = app.requests.Timeout("offline")
+        count, error = app.count_unique_commenters(client, 123)
+        self.assertIsNone(count)
+        self.assertTrue(error)
+
+    def test_name_preferred_over_name_tag(self):
+        page = response(["Alice", "Bob"])
+        for comment in page["data"]["data"]:
+            comment["name_tag"] = "Anonymous"
+        self.assertEqual(self.count([page])[0], (2, None))
 
     def test_transport(self):
         client = app.TreeholeClientSimple.__new__(app.TreeholeClientSimple)
