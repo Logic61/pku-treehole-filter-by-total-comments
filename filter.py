@@ -7,6 +7,7 @@
 """
 
 import os
+import getpass
 import sys
 import json
 import re
@@ -220,7 +221,7 @@ class TreeholeClientSimple:
         return resp.json()
 
     def sso_login(self, token):
-        url = "http://treehole.pku.edu.cn/cas_iaaa_login"
+        url = "https://treehole.pku.edu.cn/cas_iaaa_login"
         params = {
             "uuid": str(uuid.uuid4()).split("-")[-1],
             "plat": "web",
@@ -794,10 +795,10 @@ def main():
                 username, password = cfg_user, cfg_pass
             else:
                 username = input("请输入学号: ").strip()
-                password = input("请输入密码: ").strip()
+                password = getpass.getpass("请输入密码（输入不显示）: ")
         else:
             username = input("请输入学号: ").strip()
-            password = input("请输入密码: ").strip()
+            password = getpass.getpass("请输入密码（输入不显示）: ")
 
         if not username or not password:
             print("学号或密码不能为空")

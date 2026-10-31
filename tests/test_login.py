@@ -62,6 +62,8 @@ class LoginTests(unittest.TestCase):
                 response.raise_for_status = Mock()
                 client.session.get = Mock(return_value=response)
                 self.assertTrue(client.sso_login("token"))
+                self.assertEqual(client.session.get.call_args.args[0],
+                                 "https://treehole.pku.edu.cn/cas_iaaa_login")
                 self.assertEqual(client.session.headers["authorization"], f"Bearer {expected}")
                 self.assertTrue(any(c.name == "pku_token" and c.value == expected
                                     for c in client.session.cookies))
